@@ -1172,6 +1172,8 @@ class PathCleanMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             parent = pathlib.Path('/dashboard')
             request_path = pathlib.Path(posixpath.normpath(request.url.path))
             if not _is_relative_to(request_path, parent):
+                middleware_utils.mark_rejection(
+                    request, middleware_utils.REJECT_REASON_FORBIDDEN)
                 return fastapi.responses.JSONResponse(
                     status_code=403, content={'detail': 'Forbidden'})
         return await call_next(request)
@@ -1187,6 +1189,8 @@ class GracefulShutdownMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             # on-going requests but will not submit new requests.
             if not request.url.path.startswith('/api/'):
                 # Client will retry on 503 error.
+                middleware_utils.mark_rejection(
+                    request, middleware_utils.REJECT_REASON_SHUTTING_DOWN)
                 return fastapi.responses.JSONResponse(
                     status_code=503,
                     content={
@@ -1230,6 +1234,8 @@ class APIVersionMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             versions.set_remote_version(version_info.version)
             response = await call_next(request)
         else:
+            middleware_utils.mark_rejection(
+                request, middleware_utils.REJECT_REASON_API_VERSION)
             response = fastapi.responses.JSONResponse(
                 status_code=400,
                 content={
@@ -1252,7 +1258,7 @@ app = fastapi.FastAPI(prefix='/api/v1', debug=True, lifespan=lifespan)
 #   Middleware3(Middleware2(Middleware1(request)))
 # If MiddlewareN does something like print(n); call_next(); print(n), you'll get
 #   3; 2; 1; <request>; 1; 2; 3
-# The metrics middleware is added last, i.e. outermost; see below.
+# The metrics middleware is added last (outermost); see below.
 # APIVersionMiddleware also records the dispatched endpoint for workspace-access
 # classification. Added near-first => inner to PathCleanMiddleware /
 # InternalDashboardPrefixMiddleware, so the path it records is the router-
@@ -1315,9 +1321,9 @@ if __name__ == 'sky.server.server':
 # after every core and plugin middleware: it counts the response the client
 # actually receives, including the 401/403/503s the authentication, RBAC,
 # shutdown and plugin middlewares answer themselves without calling the next
-# layer. Placed inside the stack (where it used to be, as the first
-# middleware added), none of those were counted and an authentication outage
-# showed up on dashboards as a drop in successful requests rather than as
+# layer, and every WebSocket handshake (accepted or rejected). Placed inside
+# the stack, none of those would be counted and a fleet-wide auth outage
+# shows up on dashboards as a drop in successful requests rather than as
 # errors. Use environment variable to make the metrics middleware optional.
 if os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED):
     app.add_middleware(metrics.PrometheusMiddleware)
@@ -1341,7 +1347,9 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 @app.exception_handler(exceptions.ConcurrentWorkerExhaustedError)
 def handle_concurrent_worker_exhausted_error(
         request: fastapi.Request, e: exceptions.ConcurrentWorkerExhaustedError):
-    del request  # request is not used
+    # Let the metrics middleware count this 503 by cause.
+    middleware_utils.mark_rejection(
+        request, middleware_utils.REJECT_REASON_REQUEST_WORKER_EXHAUSTED)
     # Print detailed error message to server log
     logger.error('Concurrent worker exhausted: '
                  f'{common_utils.format_exception(e)}')
